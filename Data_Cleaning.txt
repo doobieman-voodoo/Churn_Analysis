@@ -1,0 +1,58 @@
+import pandas as pd
+import numpy as np
+
+# ==================== 1. LOAD DATA ====================
+df = pd.read_csv('C:/Users/shiv/Documents/Bankchurners.csv')
+
+print(f"Original shape: {df.shape}")
+
+# ==================== 2. DROP ID COLUMN (not useful for analysis) ====================
+df = df.drop(columns=['CLIENTNUM'])
+
+# ==================== 3. HANDLE 'Unknown' PLACEHOLDERS ====================
+unknown_cols = ['Education_Level', 'Marital_Status', 'Income_Category']
+for col in unknown_cols:
+    df[col] = df[col].replace('Unknown', np.nan)
+
+# ==================== 4. HANDLE SENTINEL VALUE 1438.3 ====================
+sentinel = 1438.3
+df['Credit_Limit'] = df['Credit_Limit'].replace(sentinel, np.nan)
+df['Avg_Open_To_Buy'] = df['Avg_Open_To_Buy'].replace(sentinel, np.nan)
+
+# ==================== 5. CREATE NUMERIC INCOME (great for ML & Power BI) ====================
+income_map = {
+    'Less than $40K': 20000,
+    '$40K - $60K': 50000,
+    '$60K - $80K': 70000,
+    '$80K - $120K': 100000,
+    '$120K +': 150000
+}
+df['Income_Numeric'] = df['Income_Category'].map(income_map)
+
+# ==================== 6. SMART IMPUTATION ====================
+# Fill categoricals with 'Unknown' category (keeps information)
+df['Education_Level'] = df['Education_Level'].fillna('Unknown')
+df['Marital_Status'] = df['Marital_Status'].fillna('Unknown')
+df['Income_Category'] = df['Income_Category'].fillna('Unknown')
+
+# Grouped median imputation for Credit_Limit (much better than global mean)
+df['Credit_Limit'] = df.groupby(['Card_Category', 'Income_Category'])['Credit_Limit'] \
+                      .transform(lambda x: x.fillna(x.median()))
+
+df['Avg_Open_To_Buy'] = df.groupby(['Card_Category', 'Income_Category'])['Avg_Open_To_Buy'] \
+                         .transform(lambda x: x.fillna(x.median()))
+
+# Final fallback (very few left)
+df['Credit_Limit'] = df['Credit_Limit'].fillna(df['Credit_Limit'].median())
+df['Avg_Open_To_Buy'] = df['Avg_Open_To_Buy'].fillna(df['Avg_Open_To_Buy'].median())
+
+# ==================== 7. BONUS FEATURE ENGINEERING ====================
+df['Avg_Trans_Amt'] = df['Total_Trans_Amt'] / df['Total_Trans_Ct'].replace(0, np.nan)
+df['Churn_Risk_Score'] = df['Contacts_Count_12_mon'] * df['Months_Inactive_12_mon']  # simple risk feature
+
+# ==================== 8. FINAL CHECK & SAVE ====================
+print(f"\n✅ Cleaned shape: {df.shape}")
+print("Missing values left:\n", df.isnull().sum())
+
+df.to_csv('cleaned_BankChurners.csv', index=False)
+print("✅ Saved as 'cleaned_BankChurners.csv'")

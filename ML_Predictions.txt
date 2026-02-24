@@ -1,0 +1,185 @@
+# churn_prediction_pytorch.py
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import roc_auc_score, classification_report
+import warnings
+warnings.filterwarnings('ignore')
+
+# ────────────────────────────────────────────────
+# 1. Load & Prepare Data
+# ────────────────────────────────────────────────
+df = pd.read_csv('cleaned_BankChurners.csv')
+
+# Target: binary churn
+df['Churn'] = (df['Attrition_Flag'] == 'Attrited Customer').astype(int)
+
+# Drop columns we don't need for modeling
+drop_cols = ['Attrition_Flag']  # target already encoded
+df = df.drop(columns=drop_cols, errors='ignore')
+
+# Define feature types
+categorical_cols = [
+    'Gender', 'Education_Level', 'Marital_Status', 'Income_Category',
+    'Card_Category', 'Age_Grp', 'Tenure_Bucket', 'Cred_Lim_Tier',
+    'Utilization_Grp', 'Risk_Flag'
+]
+
+numerical_cols = [
+    'Customer_Age', 'Dependent_count', 'Months_on_book', 'Total_Relationship_Count',
+    'Months_Inactive_12_mon', 'Contacts_Count_12_mon', 'Credit_Limit',
+    'Total_Revolving_Bal', 'Avg_Open_To_Buy', 'Total_Trans_Amt', 'Total_Trans_Ct',
+    'Avg_Utilization_Ratio', 'Income_Numeric', 'Avg_Trans_Amt', 'Churn_Risk_Score',
+    'Total_Amt_Chng_Q4_Q1', 'Total_Ct_Chng_Q4_Q1'
+]
+
+# Handle missing in numerical (should be very few or none after your cleaning)
+for col in numerical_cols:
+    if col in df.columns:
+        df[col] = df[col].fillna(df[col].median())
+
+# Encode categoricals → one-hot (simple & effective here)
+df_encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=True)
+
+# Features & target
+X = df_encoded.drop(columns=['Churn'])
+y = df_encoded['Churn'].values
+
+# Scale numerical features only (after one-hot)
+scaler = StandardScaler()
+num_idx = [X.columns.get_loc(c) for c in numerical_cols if c in X.columns]
+X.iloc[:, num_idx] = scaler.fit_transform(X.iloc[:, num_idx])
+
+# Train / test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=42
+)
+
+print(f"Train shape: {X_train.shape} | Test shape: {X_test.shape}")
+print(f"Churn rate in train: {y_train.mean():.4f}")
+
+# ────────────────────────────────────────────────
+# 2. PyTorch Dataset
+# ────────────────────────────────────────────────
+class ChurnDataset(Dataset):
+    def __init__(self, X, y=None):
+        self.X = torch.tensor(X.values.astype(np.float32), dtype=torch.float32)
+        self.y = torch.tensor(y.astype(np.float32), dtype=torch.float32) if y is not None else None
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        if self.y is not None:
+            return self.X[idx], self.y[idx]
+        return self.X[idx]
+
+train_ds = ChurnDataset(X_train, y_train)
+test_ds  = ChurnDataset(X_test, y_test)
+
+train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
+test_loader  = DataLoader(test_ds,  batch_size=256, shuffle=False)
+
+# ────────────────────────────────────────────────
+# 3. Simple MLP Model
+# ────────────────────────────────────────────────
+class ChurnNet(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)   # no sigmoid → use BCEWithLogitsLoss
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+model = ChurnNet(X_train.shape[1])
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+
+# ────────────────────────────────────────────────
+# 4. Training Setup
+# ────────────────────────────────────────────────
+criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([5.0]))  # ~1:5 imbalance
+optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
+
+# ────────────────────────────────────────────────
+# 5. Training Loop
+# ────────────────────────────────────────────────
+best_auc = 0
+n_epochs = 60
+
+for epoch in range(n_epochs):
+    model.train()
+    train_loss = 0
+    for Xb, yb in train_loader:
+        Xb, yb = Xb.to(device), yb.to(device)
+        optimizer.zero_grad()
+        out = model(Xb)
+        loss = criterion(out, yb)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item() * Xb.size(0)
+
+    train_loss /= len(train_ds)
+
+    # Validation
+    model.eval()
+    preds, trues, probs = [], [], []
+    val_loss = 0
+    with torch.no_grad():
+        for Xb, yb in test_loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            out = model(Xb)
+            loss = criterion(out, yb)
+            val_loss += loss.item() * Xb.size(0)
+            prob = torch.sigmoid(out)
+            probs.extend(prob.cpu().numpy())
+            preds.extend((prob > 0.5).cpu().numpy())
+            trues.extend(yb.cpu().numpy())
+
+    val_loss /= len(test_ds)
+    auc = roc_auc_score(trues, probs)
+    print(f"Epoch {epoch+1:2d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | AUC: {auc:.4f}")
+
+    scheduler.step(val_loss)
+
+    if auc > best_auc:
+        best_auc = auc
+        torch.save(model.state_dict(), 'best_churn_model.pt')
+
+print(f"\nBest AUC: {best_auc:.4f}")
+
+# ────────────────────────────────────────────────
+# 6. Full Dataset Predictions → Export for Power BI
+# ────────────────────────────────────────────────
+full_ds = ChurnDataset(X)
+full_loader = DataLoader(full_ds, batch_size=512, shuffle=False)
+
+model.load_state_dict(torch.load('best_churn_model.pt'))
+model.eval()
+
+all_probs = []
+with torch.no_grad():
+    for Xb in full_loader:
+        Xb = Xb.to(device)
+        out = model(Xb)
+        prob = torch.sigmoid(out)
+        all_probs.extend(prob.cpu().numpy())
+
+df['Churn_Probability'] = all_probs
+df['Predicted_Churn'] = (np.array(all_probs) > 0.50).astype(int)   # you can tune threshold
